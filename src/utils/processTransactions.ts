@@ -247,7 +247,6 @@ export const processTransactions = (
       }
 
       default:
-        // @ts-expect-error console warn for unsupported types
         console.warn(`Unknown operation type: ${operation.type}`)
         break
     }

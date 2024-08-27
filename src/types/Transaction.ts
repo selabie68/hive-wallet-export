@@ -16,5 +16,5 @@ export interface Transaction {
   to: string
   memo?: string
   type: OperationTypeString
-  amount: HiveAsset | HiveAssetObject
+  amount: string | HiveAsset | HiveAssetObject
 }

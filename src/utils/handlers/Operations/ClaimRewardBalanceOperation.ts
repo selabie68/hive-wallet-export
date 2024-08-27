@@ -3,6 +3,7 @@ import dayjs from 'dayjs'
 import { ClaimRewardBalanceOperation } from '@/types/Operation'
 import { Transaction } from '@/types/Transaction'
 import { HiveAccountTransaction } from '@/utils/HiveAccountTransaction'
+import { HiveAsset, isHiveAsset } from '@/utils/HiveAsset'
 
 export const claimRewardBalanceOperationHandler = (
   transaction: HiveAccountTransaction<ClaimRewardBalanceOperation>,
@@ -14,9 +15,15 @@ export const claimRewardBalanceOperationHandler = (
   const timestamp = dayjs(transaction.timestamp)
   const txHash = `${transaction.block}_${transaction.trxId}_${transaction.trxInBlock}_${transaction.opInTrx}_${transaction.opId}`
 
-  const rewardHive = operation.value.reward_hive
-  const rewardHbd = operation.value.reward_hbd
-  const rewardVests = operation.value.reward_vests
+  const rewardHive = isHiveAsset(operation.value.reward_hive)
+    ? operation.value.reward_hive
+    : new HiveAsset(operation.value.reward_hive)
+  const rewardHbd = isHiveAsset(operation.value.reward_hbd)
+    ? operation.value.reward_hbd
+    : new HiveAsset(operation.value.reward_hbd)
+  const rewardVests = isHiveAsset(operation.value.reward_vests)
+    ? operation.value.reward_vests
+    : new HiveAsset(operation.value.reward_vests)
 
   if (rewardHive.toNumber() > 0) {
     ops.push({

@@ -6,6 +6,7 @@ import {
 } from '@/types/Operation'
 import { Transaction } from '@/types/Transaction'
 import { HiveAccountTransaction } from '@/utils/HiveAccountTransaction'
+import { HiveAsset, isHiveAsset } from '@/utils/HiveAsset'
 
 export const authorRewardOperationHandler = (
   transaction: HiveAccountTransaction<
@@ -18,9 +19,15 @@ export const authorRewardOperationHandler = (
   const timestamp = dayjs(transaction.timestamp)
   const txHash = `${transaction.block}_virtual_op_${transaction.opInTrx}_${transaction.opId}`
 
-  const rewardHive = operation.value.hive_payout
-  const rewardHbd = operation.value.hbd_payout
-  const rewardVests = operation.value.vesting_payout
+  const rewardHive = isHiveAsset(operation.value.hive_payout)
+    ? operation.value.hive_payout
+    : new HiveAsset(operation.value.hive_payout)
+  const rewardHbd = isHiveAsset(operation.value.hbd_payout)
+    ? operation.value.hbd_payout
+    : new HiveAsset(operation.value.hbd_payout)
+  const rewardVests = isHiveAsset(operation.value.vesting_payout)
+    ? operation.value.vesting_payout
+    : new HiveAsset(operation.value.vesting_payout)
 
   const to =
     operation.type === 'author_reward_operation'
