@@ -1,81 +1,93 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+
 import {
   Button,
   Card,
   Col,
   DatePicker,
+  Flex,
   Form,
-  Input,
   Layout,
   Row,
   Select,
   Space,
   Switch,
+  Statistic,
   theme,
 } from 'antd'
+import { CheckOutlined, CloseOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import * as dhive from '@hiveio/dhive'
+import { useQuery } from '@tanstack/react-query'
+
 import isBetween from 'dayjs/plugin/isBetween'
+import utc from 'dayjs/plugin/utc'
 dayjs.extend(isBetween)
+dayjs.extend(utc)
 
-import type { Dayjs } from 'dayjs'
+import Logo from '@/assets/logo.svg?react'
+import {
+  ExportType,
+  CryptoTaxCalculatorExport,
+  GenericExport,
+} from '@/types/ExportType'
+import UsernameSelect from '@/components/UsernameSelect'
+import HiveTransactions from '@/components/HiveTransactions'
+import { balanceImpactingOperations } from '@/utils/balanceImpactingOperations'
+import Console from '@/components/Console'
+import useFetchAccountHistory from '@/queries/fetchAccountHistory'
+import { processTransactions } from '@/utils/processTransactions'
 
-import { ReactComponent as Logo } from '../assets/logo.svg'
-
-import ExportType from '@/types/ExportType'
-import FillVestingWithdrawOperation from '@/types/FillVestingWithdrawOperation'
-import FillOrderOperation from '@/types/FillOrderOperation'
+interface UserValue {
+  label: string
+  value: string
+}
 
 const { Header, Content } = Layout
 const { RangePicker } = DatePicker
 
 const hive = new dhive.Client([
-  'https://hive-api.arcange.eu',
   'https://api.hive.blog',
   'https://api.hivekings.com',
   'https://anyx.io',
   'https://api.openhive.network',
+  'https://hive-api.arcange.eu',
 ])
 
-const op = dhive.utils.operationOrders
-const operationsBitmask = dhive.utils.makeBitMaskFilter([
-  op.transfer,
-  op.transfer_to_vesting,
-  op.withdraw_vesting,
-  op.interest,
-  op.liquidity_reward,
-  op.transfer_to_savings,
-  op.transfer_from_savings,
-  op.fill_convert_request,
-  op.fill_order,
-  op.claim_reward_balance,
-  op.fill_vesting_withdraw,
-  op.fill_recurrent_transfer,
-]) as [number, number]
-
 const defaultDateRange = [
-  dayjs().subtract(1, 'month').startOf('month'),
-  dayjs().subtract(1, 'month').endOf('month'),
+  dayjs().utc().subtract(1, 'month').startOf('month'),
+  dayjs().utc().subtract(1, 'month').endOf('month'),
 ]
 
 const auFy = [
-  dayjs().startOf('year').subtract(6, 'months'),
-  dayjs().endOf('year').subtract(6, 'months'),
+  dayjs().utc().startOf('year').subtract(6, 'months'),
+  dayjs().utc().endOf('year').subtract(6, 'months'),
 ]
 
 const usFy = [
-  dayjs().subtract(1, 'year').startOf('year'),
-  dayjs().subtract(1, 'year').endOf('year'),
+  dayjs().utc().subtract(1, 'year').startOf('year'),
+  dayjs().utc().subtract(1, 'year').endOf('year'),
 ]
 
-interface PriceData {
-  [date: string]: number
-}
+// const hiveEngineTransactionOptions = hiveEngineOperations.map((h) => ({
+//   label: (h.charAt(0).toUpperCase() + h.slice(1))
+//     .replace(/([A-Z])/g, ' $1')
+//     .replace('Nftmarket', 'NFT Market')
+//     .replace('Nft', 'NFT')
+//     .replace(/_/g, ' - ')
+//     .replace(/(^\w{1})|(\s+\w{1})/g, (letter) => letter.toUpperCase()),
+//   value: h,
+// }))
 
 interface FormValues {
-  username: string
+  username: UserValue
   dateRange: [dayjs.Dayjs, dayjs.Dayjs]
   exportType: ExportType
+  transactionTypes: number[]
+  hiveEngineTransactionTypes: string[]
+  groupRewards: boolean
+  reconcileDay: boolean
+  allTime: boolean
 }
 
 interface HomePageProps {
@@ -85,472 +97,196 @@ interface HomePageProps {
 
 function HomePage({ setDarkMode, darkMode }: HomePageProps) {
   const [form] = Form.useForm<FormValues>()
-  const [output, setOutput] = useState<string>('')
+  const [output, setOutput] = useState<string[]>(['Welcome to Hive Exporter!'])
+  const [transactions, setTransactions] = useState<any[]>([])
   const [loading, setLoading] = useState<boolean>(false)
+  const [exportStarted, setExportStarted] = useState<boolean>(false)
+  const [exportFinished, setExportFinished] = useState<boolean>(false)
+  const [page, setPage] = useState<number>(1)
+  const [totalPages, setTotalPages] = useState<number>(0)
+  const [totalOperations, setTotalOperations] = useState<number>(0)
+
   const dateRangeValue = Form.useWatch('dateRange', form)
-  const outputConsole = useRef<HTMLPreElement>(null)
+  const usernameValue = Form.useWatch('username', form)
+  const allTimeValue = Form.useWatch('allTime', form)
+  const exportType = Form.useWatch('exportType', form)
+  const groupRewardsValue = Form.useWatch('groupRewards', form)
+  const reconcileDaysValue = Form.useWatch('reconcileDays', form)
+  const transactionTypes = Form.useWatch('transactionTypes', form)
+
+  const dateStart = useMemo(
+    () =>
+      allTimeValue
+        ? '1970-01-01T00:00:00'
+        : dateRangeValue
+          ? dateRangeValue[0].toISOString()
+          : dayjs().utc().toISOString(),
+    [allTimeValue, dateRangeValue],
+  )
+
+  const dateEnd = useMemo(
+    () =>
+      allTimeValue
+        ? dayjs().utc().toISOString()
+        : dateRangeValue
+          ? dateRangeValue[1].toISOString()
+          : dayjs().utc().toISOString(),
+    [allTimeValue, dateRangeValue],
+  )
+
+  const { isLoading, isError, data, error, isFetching } = useQuery(
+    useFetchAccountHistory(
+      {
+        _account: (usernameValue && usernameValue.value) || '',
+        _date_start: dateStart,
+        _date_end: dateEnd,
+        _body_limit: 100000,
+        _page_size: 1000,
+        _page_num: page,
+        _filter: transactionTypes,
+      },
+      loading,
+    ),
+  )
 
   const {
     token: { colorBgContainer },
   } = theme.useToken()
 
-  useEffect(() => {
-    if (outputConsole.current) {
-      outputConsole.current.scrollTop = outputConsole.current.scrollHeight
-    }
-  }, [output])
-
-  const setLastMonth = () => {
+  const setLastMonth = useCallback(() => {
     form.setFieldsValue({
       dateRange: defaultDateRange,
     })
-  }
+  }, [form])
 
   // Set the date range to the last Australian financial year
-  const setAuFy = () => {
+  const setAuFy = useCallback(() => {
     form.setFieldsValue({
       dateRange: auFy,
     })
-  }
+  }, [form])
 
   // Set the date range to the last American financial year
-  const setUsFy = () => {
+  const setUsFy = useCallback(() => {
     form.setFieldsValue({
       dateRange: usFy,
     })
-  }
+  }, [form])
 
-  // Use CoinGecko API to get price data for date range
-  const getPrices = async (symbol: string, start: Dayjs, end: Dayjs) => {
-    const response = await fetch(
-      `https://api.coingecko.com/api/v3/coins/${symbol}/market_chart/range?vs_currency=usd&from=${start.unix()}&to=${end.unix()}`,
-    )
+  useEffect(() => {
+    if (data) {
+      if (totalPages === 0) {
+        setTotalPages(() => data.total_pages)
+        setTotalOperations(() => data.total_operations)
 
-    const data = await response.json()
-
-    // Convert to object with date as key and price as value
-    const prices = data.prices.reduce(
-      (acc: PriceData, [date, price]: [number, number]) => {
-        acc[dayjs(date).format('YYYY-MM-DD')] = price
-
-        return acc
-      },
-      {},
-    )
-
-    return prices
-  }
-
-  const getTransactions = async (username: string, from: number) => {
-    // Use dhive to get the data from the blockchain
-    return hive.database.getAccountHistory(
-      username,
-      from,
-      1000,
-      operationsBitmask,
-    )
-  }
-
-  const onFinish = async (values: FormValues) => {
-    setLoading(true)
-    const { username, dateRange, exportType } = values
-    const [startDate, endDate] = dateRange
-    const exportTypeName =
-      exportType === ExportType.Koinly ? 'Koinly' : 'CryptoTaxCalculator'
-
-    const start = startDate.format('YYYY-MM-DD')
-    const end = endDate.format('YYYY-MM-DD')
-    let currentFrom = -1
-    let page = 1
-
-    setOutput(`Exporting data for ${username}...\n`)
-    setOutput((output) => `${output}Date range: ${start} to ${end}\n`)
-    setOutput((output) => `${output}Export type: ${exportTypeName}\n`)
-    setOutput((output) => `${output}Getting price data...\n`)
-
-    const priceDataHive = await getPrices('hive', startDate, endDate)
-    const priceDataHbd = await getPrices('hive_dollar', startDate, endDate)
-
-    const headers = []
-
-    if (exportType === ExportType.Koinly) {
-      headers.push(
-        'Date',
-        'Sent Amount',
-        'Sent Currency',
-        'Received Amount',
-        'Received Currency',
-        'Fee Amount',
-        'Fee Currency',
-        'Net Worth Amount',
-        'Net Worth Currency',
-        'Label',
-        'Description',
-        'TxHash',
-      )
-    } else if (exportType === ExportType.CryptoTaxCalculator) {
-      headers.push(
-        'Timestamp (UTC)',
-        'Type',
-        'Base Currency',
-        'Base Amount',
-        'Quote Currency (Optional)',
-        'Quote Amount (Optional)',
-        'Fee Currency (Optional)',
-        'Fee Amount (Optional)',
-        'From (Optional)',
-        'To (Optional)',
-        'Blockchain (Optional)',
-        'ID (Optional)',
-        'Description (Optional)',
-        'Reference Price Per Unit (Optional)',
-        'Reference Price Currency (Optional)',
-      )
-    }
-
-    // Generate the CSV file
-    const csv = [headers]
-
-    // Keep track of whether we've reached the end of the date range
-    let finishedLooping = false
-
-    // Loop through transactions until we reach the end of the date range
-    while (finishedLooping === false) {
-      setOutput((output) => `${output}Getting transactions page ${page}...\n`)
-      const result = await getTransactions(username, currentFrom)
-      setOutput((output) => `${output}Found ${result.length} transactions.\n`)
-
-      result.forEach(([, operation]) => {
-        const timestamp = dayjs(operation.timestamp)
-
-        // Only include operations within the date range
-        if (!timestamp.isBetween(start, end, 'day', '[]')) {
-          return
-        }
-
-        const usdPriceHive = priceDataHive[timestamp.format('YYYY-MM-DD')]
-        const usdPriceHbd = priceDataHbd[timestamp.format('YYYY-MM-DD')]
-
-        // op.transfer,
-        // op.transfer_to_vesting,
-        // op.withdraw_vesting,
-        // op.interest,
-        // op.liquidity_reward,
-        // op.transfer_to_savings,
-        // op.transfer_from_savings,
-        // op.fill_convert_request,
-        // op.fill_order,
-        // op.claim_reward_balance,
-        // op.fill_vesting_withdraw,
-
-        console.log(operation)
-
-        switch (operation.op[0]) {
-          case 'transfer':
-          case 'transfer_to_vesting': {
-            const op = operation.op as dhive.TransferOperation
-            const [amountStr, symbol] = String(op[1].amount).split(' ')
-            const amount = Number(amountStr.replace(/,/g, ''))
-            const to = op[1].to
-            // make the memo safe for CSV
-            const memo = op[1].memo
-              ? op[1].memo
-                  .replace(/"/g, '""')
-                  .replace(/\n/g, ' ')
-                  .replace(/\r/g, ' ')
-                  .replace(/,/g, ' ')
-                  .replace(/;/g, ' ')
-              : ''
-            const txHash = operation.trx_id
-
-            if (exportType === ExportType.Koinly) {
-              csv.push([
-                timestamp.format('YYYY-MM-DD HH:mm:ss UTC'), // Date
-                to === username ? '' : amountStr, // Sent Amount
-                to === username ? '' : symbol, // Sent Currency
-                to === username ? amountStr : '', // Received Amount
-                to === username ? symbol : '', // Received Currency
-                '', // Fee Amount
-                '', // Fee Currency
-                symbol === 'HIVE'
-                  ? (amount * usdPriceHive).toFixed(2)
-                  : (amount * usdPriceHbd).toFixed(2), // Net Worth Amount
-                'USD', // Net Worth Currency
-                to === username ? 'receive' : 'send', // Label
-                memo, // Description
-                txHash, // TxHash
-              ])
-            } else if (exportType === ExportType.CryptoTaxCalculator) {
-              csv.push([
-                timestamp.format('YYYY-MM-DD HH:mm:ss'), // Timestamp (UTC)
-                to === username ? 'receive' : 'send', // Type
-                symbol, // Base Currency
-                amount, // Base Amount
-                '', // Quote Currency
-                '', // Quote Amount
-                '', // Fee Currency
-                '', // Fee Amount
-                '', // From
-                '', // To
-                'Hive', // Blockchain
-                txHash, // ID
-                memo, // Description
-                symbol === 'HIVE' ? usdPriceHive : usdPriceHbd, // Reference Price Per Unit
-                'USD', // Reference Price Currency
-              ])
-            }
-
-            break
-          }
-          case 'claim_reward_balance': {
-            const op = operation.op as dhive.ClaimRewardBalanceOperation
-
-            const [rewardHiveStr] = String(op[1].reward_hive).split(' ')
-            const [rewardHbdStr] = String(op[1].reward_hbd).split(' ')
-            // const [rewardVestsStr] = String(
-            //   op[1].reward_vests,
-            // ).split(' ')
-
-            const rewardHive = Number(rewardHiveStr.replace(/,/g, ''))
-            const rewardHbd = Number(rewardHbdStr.replace(/,/g, ''))
-            // const rewardVests = Number(rewardVestsStr.replace(/,/g, ''))
-            const txHash = operation.trx_id
-
-            if (exportType === ExportType.Koinly) {
-              const csvLineTemplate = [
-                timestamp.format('YYYY-MM-DD HH:mm:ss UTC'), // Date
-                '', // Sent Amount
-                '', // Sent Currency
-                '', // Received Amount
-                '', // Received Currency
-                '', // Fee Amount
-                '', // Fee Currency
-                '', // Net Worth Amount
-                'USD', // Net Worth Currency
-                'mining', // Label
-                '', // Description
-                txHash, // TxHash
-              ]
-
-              if (rewardHive > 0) {
-                const csvLine = [...csvLineTemplate]
-                csvLine[3] = rewardHive.toFixed(2)
-                csvLine[4] = 'HIVE'
-                csvLine[7] = (rewardHive * usdPriceHive).toFixed(2)
-
-                csv.push(csvLine)
-              }
-
-              if (rewardHbd > 0) {
-                const csvLine = [...csvLineTemplate]
-                csvLine[3] = rewardHbd.toFixed(2)
-                csvLine[4] = 'HBD'
-                csvLine[7] = (rewardHbd * usdPriceHbd).toFixed(2)
-
-                csv.push(csvLine)
-              }
-
-              // if (rewardVests > 0) {
-              //   const csvLine = [...csvLineTemplate]
-              //   csvLine[3] = rewardVests.toFixed(2)
-              //   csvLine[4] = 'VESTS'
-
-              //   csv.push(csvLine)
-              // }
-            } else if (exportType === ExportType.CryptoTaxCalculator) {
-              const csvLineTemplate = [
-                timestamp.format('YYYY-MM-DD HH:mm:ss'), // Timestamp (UTC)
-                'receive', // Type
-                '', // Base Currency
-                '', // Base Amount
-                '', // Quote Currency
-                '', // Quote Amount
-                '', // Fee Currency
-                '', // Fee Amount
-                '', // From
-                '', // To
-                'Hive', // Blockchain
-                txHash, // ID
-                '', // Description
-                '', // Reference Price Per Unit
-                'USD', // Reference Price Currency
-              ]
-
-              if (rewardHive > 0) {
-                const csvLine = [...csvLineTemplate]
-                csvLine[2] = 'HIVE'
-                csvLine[3] = rewardHive.toFixed(2)
-                csvLine[7] = usdPriceHive
-
-                csv.push(csvLine)
-              }
-
-              if (rewardHbd > 0) {
-                const csvLine = [...csvLineTemplate]
-                csvLine[2] = 'HBD'
-                csvLine[3] = rewardHbd.toFixed(2)
-                csvLine[7] = usdPriceHbd
-
-                csv.push(csvLine)
-              }
-
-              // if (rewardVests > 0) {
-              //   const csvLine = [...csvLineTemplate]
-              //   csvLine[2] = 'VESTS'
-              //   csvLine[3] = rewardVests.toFixed(2)
-
-              //   csv.push(csvLine)
-              // }
-            }
-            break
-          }
-          case 'fill_vesting_withdraw': {
-            const op = operation.op as unknown as FillVestingWithdrawOperation
-
-            const [depositedStr, assetName] = String(op[1].deposited).split(' ')
-            const deposited = Number(depositedStr.replace(/,/g, ''))
-            const txHash = operation.trx_id
-            if (exportType === ExportType.Koinly) {
-              csv.push([
-                timestamp.format('YYYY-MM-DD HH:mm:ss UTC'), // Date
-                '', // Sent Amount
-                '', // Sent Currency
-                deposited.toFixed(2), // Received Amount
-                assetName, // Received Currency
-                '', // Fee Amount
-                '', // Fee Currency
-                assetName === 'HIVE'
-                  ? (deposited * usdPriceHive).toFixed(2)
-                  : (deposited * usdPriceHbd).toFixed(2), // Net Worth Amount
-                'USD', // Net Worth Currency
-                'staking', // Label
-                '', // Description
-                String(txHash), // TxHash
-              ])
-            } else if (exportType === ExportType.CryptoTaxCalculator) {
-              csv.push([
-                timestamp.format('YYYY-MM-DD HH:mm:ss'), // Timestamp (UTC)
-                'receive', // Type
-                assetName, // Base Currency
-                deposited.toFixed(2), // Base Amount
-                '', // Quote Currency
-                '', // Quote Amount
-                '', // Fee Currency
-                '', // Fee Amount
-                '', // From
-                '', // To
-                'Hive', // Blockchain
-                txHash, // ID
-                'Powerdown', // Description
-                assetName === 'HIVE'
-                  ? usdPriceHive.toFixed(2)
-                  : usdPriceHbd.toFixed(2), // Reference Price Per Unit
-                'USD', // Reference Price Currency
-              ])
-            }
-
-            break
-          }
-          case 'fill_order': {
-            const op = operation.op as unknown as FillOrderOperation
-
-            const currentOwner = op[1].current_owner
-            const [currentPaysStr, currentPaysAssetName] = String(
-              op[1].current_pays,
-            ).split(' ')
-            const currentPays = Number(currentPaysStr.replace(/,/g, ''))
-
-            const openOwner = op[1].open_owner
-            const [openPaysStr, openPaysAssetName] = String(
-              op[1].open_pays,
-            ).split(' ')
-            const openPays = Number(openPaysStr.replace(/,/g, ''))
-            const txHash = operation.trx_id
-
-            if (exportType === ExportType.Koinly) {
-              csv.push([
-                timestamp.format('YYYY-MM-DD HH:mm:ss UTC'), // Date
-                currentOwner === username
-                  ? currentPays.toFixed(3)
-                  : openPays.toFixed(3), // Sent Amount
-                currentOwner === username
-                  ? currentPaysAssetName
-                  : openPaysAssetName, // Sent Currency
-                currentOwner === username
-                  ? openPays.toFixed(3)
-                  : currentPays.toFixed(3), // Received Amount
-                currentOwner === username
-                  ? openPaysAssetName
-                  : currentPaysAssetName, // Received Currency
-                '', // Fee Amount
-                '', // Fee Currency
-                currentPaysAssetName === 'HIVE'
-                  ? (currentPays * usdPriceHive).toFixed(2)
-                  : (openPays * usdPriceHive).toFixed(2), // Net Worth Amount
-                'USD', // Net Worth Currency
-                'trade', // Label
-                `Hive on-chain market trade ${currentOwner} ${currentPaysStr} ${currentPaysAssetName} to ${openOwner} ${openPaysStr} ${openPaysAssetName}`, // Description
-                String(txHash), // TxHash
-              ])
-            } else if (exportType === ExportType.CryptoTaxCalculator) {
-              csv.push([
-                timestamp.format('YYYY-MM-DD HH:mm:ss'), // Timestamp (UTC)
-                currentOwner === username ? 'buy' : 'sell', // Type
-                openPaysAssetName, // Base Currency
-                openPays.toFixed(3), // Base Amount
-                currentPaysAssetName, // Quote Currency
-                currentPays.toFixed(3), // Quote Amount
-                '', // Fee Currency
-                '', // Fee Amount
-                '', // From
-                '', // To
-                'Hive', // Blockchain
-                txHash, // ID
-                `Hive on-chain market trade ${currentOwner} ${currentPaysStr} ${currentPaysAssetName} to ${openOwner} ${openPaysStr} ${openPaysAssetName}`, // Description
-                currentPaysAssetName === 'HIVE'
-                  ? usdPriceHive.toFixed(2)
-                  : usdPriceHbd.toFixed(2), // Reference Price Per Unit
-                'USD', // Reference Price Currency
-              ])
-            }
-            break
-          }
-          default:
-            break
-        }
-      })
-
-      // If we've reached the end of the date range, stop
-      if (
-        result.length < 1000 ||
-        dayjs(result[0][1].timestamp).isBefore(startDate, 'day')
-      ) {
-        finishedLooping = true
+        return
       }
 
-      // Set the from to the last transaction we got
-      currentFrom = result[0][0]
-      page++
+      setTransactions((transactions) => [
+        ...transactions,
+        ...data.operations_result,
+      ])
+
+      if (page >= totalPages) {
+        setLoading(false)
+        setExportStarted(true)
+      } else {
+        setPage((page) => page + 1)
+      }
     }
+  }, [data, totalPages, page])
 
-    setOutput((output) => `${output}Exporting CSV...\n`)
+  useEffect(() => {
+    if (
+      exportStarted &&
+      !exportFinished &&
+      !isLoading &&
+      !isFetching &&
+      transactions.length === totalOperations
+    ) {
+      processTransactions(
+        transactions,
+        exportType,
+        usernameValue.value,
+        groupRewardsValue,
+        reconcileDaysValue,
+        setOutput,
+      )
 
-    // Convert the CSV array to a string.
-    // We wrap the columns in quotes to prevent commas in the memo field from breaking the CSV
-    const csvContent = csv
-      .map((line) => line.map((col) => `"${col}"`).join(','))
-      .join('\n')
+      setTransactions([])
+      setExportStarted(false)
+      setExportFinished(true)
+    }
+  }, [
+    exportStarted,
+    exportFinished,
+    isLoading,
+    isFetching,
+    transactions,
+    exportType,
+    usernameValue,
+    groupRewardsValue,
+    reconcileDaysValue,
+    totalOperations,
+    setOutput,
+  ])
 
-    // Download the CSV file
-    const element = document.createElement('a')
-    element.href = `data:text/csv;charset=utf-8,${encodeURI(csvContent)}`
-    element.target = '_blank'
-    element.download = `hive-wallet-export-${username}-${start}-${end}.csv`
-    element.click()
+  useEffect(() => {
+    if (page && isFetching) {
+      setOutput((output) => [...output, `Fetching data for page ${page}...`])
+    }
+  }, [isFetching, page])
 
-    setOutput((output) => `${output}Exporting Complete.\n`)
-    setLoading(false)
+  useEffect(() => {
+    if (isError) {
+      setOutput((output) => [...output, error.message])
+    }
+  }, [isError, error])
+
+  const onFinish = () => {
+    setExportFinished(false)
+    setLoading(true)
   }
+
+  async function fetchUserList(username: string): Promise<UserValue[]> {
+    return hive
+      .call('condenser_api', 'get_account_reputations', [username, 10])
+      .then((results) =>
+        results.map(
+          (user: { account: string; reputation: number | string }) => ({
+            label: user.account,
+            value: user.account,
+          }),
+        ),
+      )
+  }
+
+  // const collapseItems: CollapseProps['items'] = [
+  //   {
+  //     key: '1',
+  //     label: 'Hive Transaction Types',
+  //     forceRender: true,
+  //     children: (
+  //       <HiveTransactions
+  //         form={form}
+  //         formItemName="transactionTypes"
+  //         transactionOptions={balanceImpactingOperations}
+  //       />
+  //     ),
+  //   },
+  //   {
+  //     key: '2',
+  //     label: 'Hive Engine Transaction Types',
+  //     forceRender: true,
+  //     children: (
+  //       <HiveTransactions
+  //         form={form}
+  //         formItemName="hiveEngineTransactionTypes"
+  //         transactionOptions={hiveEngineTransactionOptions}
+  //       />
+  //     ),
+  //   },
+  // ]
 
   return (
     <Layout>
@@ -562,12 +298,7 @@ function HomePage({ setDarkMode, darkMode }: HomePageProps) {
           background: colorBgContainer,
         }}
       >
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-          }}
-        >
+        <Flex align="center">
           <Logo
             style={{
               height: '32px',
@@ -576,7 +307,7 @@ function HomePage({ setDarkMode, darkMode }: HomePageProps) {
             }}
           />
           Hive Wallet Export
-        </div>
+        </Flex>
         <Switch
           checked={darkMode}
           checkedChildren="🌙"
@@ -588,112 +319,205 @@ function HomePage({ setDarkMode, darkMode }: HomePageProps) {
         />
       </Header>
       <Content>
-        <Card
-          title="Export"
-          style={{
-            width: '30%',
-            margin: 'auto',
-            marginTop: '20px',
-          }}
-        >
-          <Form
-            form={form}
-            layout="vertical"
-            onFinish={onFinish}
-            initialValues={{
-              dateRange: defaultDateRange,
-              exportType: ExportType.Koinly,
+        <Flex align="center" vertical>
+          <Card
+            title="Export"
+            style={{
+              maxWidth: '700px',
+              margin: '20px',
             }}
           >
-            <Row gutter={[16, 16]}>
-              <Col span={16}>
-                <Form.Item
-                  label="HIVE Username"
-                  name="username"
-                  rules={[{ required: true }]}
-                >
-                  <Input placeholder="Enter your HIVE username" />
-                </Form.Item>
-              </Col>
-            </Row>
-            <Row gutter={[16, 16]}>
-              <Col span={12}>
-                <Form.Item
-                  label="Export Date Range"
-                  name="dateRange"
-                  rules={[{ required: true }]}
-                >
-                  <RangePicker />
-                </Form.Item>
-              </Col>
-              <Col span={12}>
-                <Form.Item label=" ">
-                  <Space>
-                    <Button
-                      color={
-                        dateRangeValue && dateRangeValue === defaultDateRange
-                          ? 'primary'
-                          : 'default'
-                      }
-                      onClick={setLastMonth}
-                    >
-                      Last Month
-                    </Button>
-                    <Button
-                      color={
-                        form.getFieldValue('dateRange') === auFy
-                          ? 'primary'
-                          : 'default'
-                      }
-                      onClick={setAuFy}
-                    >
-                      AU FY
-                    </Button>
-                    <Button onClick={setUsFy}>US FY</Button>
-                  </Space>
-                </Form.Item>
-              </Col>
-            </Row>
-            <Row gutter={[16, 16]}>
-              <Col span={12}>
-                <Form.Item
-                  label="Export Type"
-                  name="exportType"
-                  rules={[{ required: true }]}
-                >
-                  <Select>
-                    <Select.Option value={ExportType.Koinly}>
-                      Koinly
-                    </Select.Option>
-                    <Select.Option value={ExportType.CryptoTaxCalculator}>
-                      CryptoTaxCalculator
-                    </Select.Option>
-                  </Select>
-                </Form.Item>
-              </Col>
-            </Row>
-            <Row gutter={[16, 16]}>
-              <Col span={12}>
-                <Form.Item>
-                  <Button type="primary" htmlType="submit" loading={loading}>
-                    Export
-                  </Button>
-                </Form.Item>
-              </Col>
-            </Row>
-          </Form>
-
-          <Card style={{ marginTop: 16 }} type="inner" title="Output">
-            <pre
-              ref={outputConsole}
-              style={{
-                maxHeight: 150,
+            <Form
+              form={form}
+              layout="vertical"
+              onFinish={onFinish}
+              initialValues={{
+                dateRange: defaultDateRange,
+                exportType: ExportType.Generic,
+                transactionTypes: balanceImpactingOperations.map(
+                  (t) => t.value,
+                ),
+                // hiveEngineTransactionTypes: hiveEngineTransactionOptions.map(
+                //   (t) => t.value,
+                // ),
+                groupRewards: true,
+                allTime: false,
               }}
             >
-              {output}
-            </pre>
+              <Row gutter={[16, 16]}>
+                <Col span={16}>
+                  <Form.Item
+                    label="HIVE Username"
+                    name="username"
+                    rules={[{ required: true }]}
+                  >
+                    <UsernameSelect
+                      showSearch
+                      placeholder="Select username"
+                      fetchOptions={fetchUserList}
+                      style={{ width: '100%' }}
+                    />
+                  </Form.Item>
+                </Col>
+              </Row>
+              <Row gutter={[16, 16]}>
+                <Col span={16}>
+                  <Form.Item
+                    label="Export All"
+                    name="allTime"
+                    tooltip="If enabled, all transactions will be exported."
+                    valuePropName="checked"
+                  >
+                    <Switch
+                      checkedChildren={<CheckOutlined />}
+                      unCheckedChildren={<CloseOutlined />}
+                    />
+                  </Form.Item>
+                </Col>
+              </Row>
+              <Row
+                style={{ display: allTimeValue ? 'none' : undefined }}
+                gutter={[16, 16]}
+              >
+                <Col span={12}>
+                  <Form.Item
+                    label="Export Date Range"
+                    name="dateRange"
+                    rules={[{ required: true }]}
+                  >
+                    <RangePicker
+                      format={(date) => date.utc().format('YYYY-MM-DD')}
+                    />
+                  </Form.Item>
+                </Col>
+                <Col span={12}>
+                  <Form.Item label=" ">
+                    <Space>
+                      <Button
+                        color={
+                          dateRangeValue &&
+                          JSON.stringify(dateRangeValue) ===
+                            JSON.stringify(defaultDateRange)
+                            ? 'primary'
+                            : 'default'
+                        }
+                        onClick={setLastMonth}
+                      >
+                        Last Month
+                      </Button>
+                      <Button
+                        color={
+                          dateRangeValue &&
+                          JSON.stringify(dateRangeValue) ===
+                            JSON.stringify(auFy)
+                            ? 'primary'
+                            : 'default'
+                        }
+                        onClick={setAuFy}
+                      >
+                        AU FY
+                      </Button>
+                      <Button onClick={setUsFy}>US FY</Button>
+                    </Space>
+                  </Form.Item>
+                </Col>
+              </Row>
+              <Row gutter={[16, 16]}>
+                <Col span={24}>
+                  <Form.Item
+                    label="Group Rewards"
+                    name="groupRewards"
+                    tooltip="If enabled, reward claims will be grouped between other transactions. This is useful for reducing the number of transactions in your export."
+                    valuePropName="checked"
+                  >
+                    <Switch />
+                  </Form.Item>
+                </Col>
+              </Row>
+              <Row gutter={[16, 16]}>
+                <Col span={24}>
+                  <Form.Item
+                    label="Reconcile each day"
+                    name="reconcileDays"
+                    tooltip="If enabled, grouped rewards will be reconciled each day instead of rolling over."
+                    valuePropName="checked"
+                  >
+                    <Switch />
+                  </Form.Item>
+                </Col>
+              </Row>
+              <Row gutter={[16, 16]}>
+                <Col span={24}>
+                  <HiveTransactions
+                    form={form}
+                    formItemName="transactionTypes"
+                    transactionOptions={balanceImpactingOperations}
+                  />
+                </Col>
+              </Row>
+              <Row gutter={[16, 16]}>
+                <Col span={12}>
+                  <Form.Item
+                    label="Export Type"
+                    name="exportType"
+                    rules={[{ required: true }]}
+                  >
+                    <Select>
+                      <Select.Option value={ExportType.Generic}>
+                        {new GenericExport().name}
+                      </Select.Option>
+                      <Select.Option value={ExportType.CryptoTaxCalculator}>
+                        {new CryptoTaxCalculatorExport().name}
+                      </Select.Option>
+                    </Select>
+                  </Form.Item>
+                </Col>
+              </Row>
+              <Row gutter={[16, 16]}>
+                <Col span={12}>
+                  <Form.Item>
+                    <Button type="primary" htmlType="submit" loading={loading}>
+                      Export
+                    </Button>
+                  </Form.Item>
+                </Col>
+              </Row>
+            </Form>
+            <Row gutter={[16, 16]}>
+              <Col sm={12} lg={8}>
+                <Card>
+                  <Statistic title="Current Page" value={page} />
+                </Card>
+              </Col>
+              <Col sm={12} lg={8}>
+                <Card>
+                  <Statistic title="Total Pages" value={totalPages} />
+                </Card>
+              </Col>
+              <Col sm={12} lg={8}>
+                <Card>
+                  <Statistic
+                    title="Current Transactions"
+                    value={transactions.length}
+                  />
+                </Card>
+              </Col>
+              <Col sm={12} lg={8}>
+                <Card>
+                  <Statistic
+                    title="Total Transactions"
+                    value={totalOperations}
+                  />
+                </Card>
+              </Col>
+            </Row>
+            <Row gutter={[16, 16]}>
+              <Col span={24}>
+                <Console style={{ marginTop: 16 }} logs={output} />
+              </Col>
+            </Row>
           </Card>
-        </Card>
+        </Flex>
       </Content>
     </Layout>
   )
